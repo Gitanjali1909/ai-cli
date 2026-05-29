@@ -19,38 +19,24 @@ Avoid huge paragraphs and unnecessary explanation.
 Focus on clarity over length.
 """
 
-EXPLAIN_CODE_RULES = """
-Explain the code like a senior developer teaching a junior developer.
-Be concise but clear, and avoid generic statements.
-Only use information present in the given code.
-Never mention libraries, functions, or behavior not present in the code.
-Do not assume libraries or functionality not shown.
-If something is unclear, say "Not स्पष्ट from code".
-Do not invent examples unrelated to the code.
-Directly reference actual code elements from the provided code.
-When explaining, reference actual code snippets in backticks.
-Example style: "The line `app = typer.Typer()` initializes the CLI app."
-Use this exact structure:
-1. Overview
-2. Key Components
-3. Step-by-step flow
-4. Example
-5. Simple explanation
-
-For each section:
-- Overview: say what this specific code does.
-- Key Components: explain important imports, functions, classes, or variables.
-- Step-by-step flow: describe the execution path.
-- Example: include a tiny example only if it helps.
-- Simple explanation: explain it in ELI5 style.
-
-Use bullets where helpful.
-Keep each point specific to the code provided.
-"""
-
-SECTION_HEADINGS = {
+EXPLAIN_SECTION_HEADINGS = {
     "Overview",
     "Key Components",
+    "Execution Flow",
+    "Simple Explanation",
+}
+
+REVIEW_SECTION_HEADINGS = {
+    "Code Quality Issues",
+    "Bugs / Risks",
+    "Suggestions",
+    "Improved Code Snippets",
+}
+
+SECTION_HEADINGS = EXPLAIN_SECTION_HEADINGS | REVIEW_SECTION_HEADINGS | {
+    "Key Parts",
+    "Execution flow",
+    "Important note",
     "Step-by-step flow",
     "Example",
     "Simple explanation",
@@ -58,16 +44,69 @@ SECTION_HEADINGS = {
     "How it works",
 }
 
+EXPLAIN_CODE_RULES = """
+STRICT FORMAT.
+Output ONLY these sections, in this exact order:
+1. Overview
+2. Key Components
+3. Execution Flow
+4. Simple Explanation
 
-def render_ai_output(output: str) -> None:
+Rules:
+- Keep the full output under 150 words.
+- Be direct and technical.
+- Only use information present in the given code.
+- Never mention libraries, functions, or behavior not present in the code.
+- Do not assume libraries or functionality not shown.
+- If something is unclear, say "Not स्पष्ट from code".
+- Reference actual code snippets in backticks when useful.
+- Do not include anything unrelated to the given code.
+- Do not add extra sections.
+- Do not create stories, puzzles, scenarios, rules, games, or examples.
+- Do not invent rules or examples.
+- Never create hypothetical scenarios.
+- Never simulate multiple users.
+- Never use "imagine", "suppose", or "let's say".
+"""
+
+REVIEW_RULES = """
+Review the code like a senior developer reviewing a PR.
+Only use information present in the given code.
+Never mention libraries, functions, or behavior not present in the code.
+Be concise, direct, and constructive.
+Prioritize real risks over style nitpicks.
+Reference actual code snippets in backticks when explaining issues.
+Do not repeat the entire code block.
+Do not repeat sections.
+Use this exact structure:
+1. Code Quality Issues
+2. Bugs / Risks
+3. Suggestions
+4. Improved Code Snippets
+
+For each section:
+- Code Quality Issues: point out maintainability, naming, structure, or readability concerns.
+- Bugs / Risks: call out behavior that may fail or produce incorrect results.
+- Suggestions: give practical fixes a developer can apply.
+- Improved Code Snippets: include only small, relevant snippets when useful.
+"""
+
+
+def render_ai_output(
+    output: str,
+    allowed_headings=None,
+    default_heading: str = "Overview",
+) -> None:
+    allowed_headings = allowed_headings or SECTION_HEADINGS
+    output = clean_ai_output(output, allowed_headings)
     printed = False
     has_heading = any(
-        parse_heading(line.strip()) in SECTION_HEADINGS
+        parse_heading(line.strip(), allowed_headings) in allowed_headings
         for line in output.strip().splitlines()
     )
 
     if not has_heading:
-        console.print(Text("Overview", style="bold cyan"))
+        console.print(Text(default_heading, style="bold cyan"))
         printed = True
 
     for raw_line in output.strip().splitlines():
@@ -77,8 +116,8 @@ def render_ai_output(output: str) -> None:
                 console.print()
             continue
 
-        heading = parse_heading(line)
-        if heading in SECTION_HEADINGS:
+        heading = parse_heading(line, allowed_headings)
+        if heading in allowed_headings:
             if printed:
                 console.print()
             console.print(Text(heading, style="bold cyan"))
@@ -89,14 +128,19 @@ def render_ai_output(output: str) -> None:
         printed = True
 
 
-def parse_heading(line: str):
+def parse_heading(line: str, headings=None):
+    headings = headings or SECTION_HEADINGS
     cleaned = re.sub(r"^\s*\d+[\).]\s*", "", line).strip()
     cleaned = cleaned.strip("*_# ").rstrip(":").strip()
-    return cleaned if cleaned in SECTION_HEADINGS else None
+    return cleaned if cleaned in headings else None
+
+
+def parse_known_heading(line: str):
+    return parse_heading(line, SECTION_HEADINGS)
 
 
 def format_body_line(line: str) -> str:
-    bullet_match = re.match(r"^([-*•]\s+)(.*)", line)
+    bullet_match = re.match(r"^([-*]\s+)(.*)", line)
     if bullet_match:
         bullet, body = bullet_match.groups()
         return fill(
@@ -107,6 +151,43 @@ def format_body_line(line: str) -> str:
         )
 
     return fill(line, width=88)
+
+
+def clean_ai_output(output: str, allowed_headings=None) -> str:
+    allowed_headings = allowed_headings or SECTION_HEADINGS
+    cleaned_lines = []
+    seen_headings = set()
+    skip_section = False
+    in_code_block = False
+    kept_code_block = False
+
+    for raw_line in output.strip().splitlines():
+        line = raw_line.rstrip()
+        known_heading = parse_known_heading(line.strip())
+
+        if known_heading:
+            if known_heading not in allowed_headings or known_heading in seen_headings:
+                skip_section = True
+                continue
+            seen_headings.add(known_heading)
+            skip_section = False
+
+        if skip_section:
+            continue
+
+        if line.strip().startswith("```"):
+            if kept_code_block and not in_code_block:
+                skip_section = True
+                continue
+            in_code_block = not in_code_block
+            cleaned_lines.append(line)
+            if not in_code_block:
+                kept_code_block = True
+            continue
+
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines)
 
 
 def iter_project_files():
@@ -166,20 +247,39 @@ def show_file_not_found(suggestion=None) -> None:
         )
 
 
-def explain_code(file_path: str):
+def read_code_file(file_path: str):
     path, suggestion = find_project_file(file_path)
     if path is None:
         show_file_not_found(suggestion)
-        return
+        return None
 
     try:
-        code = path.read_text()
+        return path.read_text()
     except (OSError, UnicodeDecodeError):
         console.print("Could not read this file safely.", style="bold red")
+        return None
+
+
+def explain_code(file_path: str):
+    code = read_code_file(file_path)
+    if code is None:
         return
 
     prompt = f"{RESPONSE_RULES}\n{EXPLAIN_CODE_RULES}\nCode:\n\n{code}"
-    render_ai_output(ask_llm(prompt))
+    render_ai_output(ask_llm(prompt), EXPLAIN_SECTION_HEADINGS)
+
+
+def review(file_path: str):
+    code = read_code_file(file_path)
+    if code is None:
+        return
+
+    prompt = f"{RESPONSE_RULES}\n{REVIEW_RULES}\nCode:\n\n{code}"
+    render_ai_output(
+        ask_llm(prompt),
+        REVIEW_SECTION_HEADINGS,
+        default_heading="Code Quality Issues",
+    )
 
 
 def fix_bug(file_path: str):
