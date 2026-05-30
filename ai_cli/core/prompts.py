@@ -10,24 +10,26 @@ Rules:
 
 def explain_prompt(code: str) -> str:
     return f"""
-You are a senior Python developer.
+You are a senior software engineer reviewing Python CLI tools.
 
-Explain the following code STRICTLY based on the given input.
+TASK:
+Explain the given code STRICTLY based on what is present.
 
-Rules:
-- Do NOT assume anything not present in the code
-- Do NOT call it a chatbot unless clearly visible
-- Be precise and technical
-- Keep it clear and structured
+RULES:
+- Do NOT guess or assume extra functionality
+- Do NOT call it a chatbot or AI system unless explicitly present
+- If Typer CLI is used, describe it as a command-line interface tool
+- Be precise, technical, and realistic
+- Avoid marketing-style or vague explanations
 
-Format:
+FORMAT:
 
-1. What this code does (1-2 lines)
-2. Key parts (bullet points)
-3. Flow of execution (step-by-step)
-4. Simple explanation (for beginner)
+1. What this file does (1-2 lines)
+2. Main components (bullet points)
+3. Execution flow (step-by-step)
+4. Simple explanation (beginner-friendly but accurate)
 
-Code:
+CODE:
 {code}
 """
 
