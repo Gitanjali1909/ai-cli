@@ -18,6 +18,7 @@ node_modules/
 # Generated assets
 *.mp4
 *.zip
+.ai_cli_last.json
 
 # OS stuff
 .DS_Store
