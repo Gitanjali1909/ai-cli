@@ -1,7 +1,8 @@
 import json
 from pathlib import Path
 import subprocess
-from typing import Literal
+from typing import Literal, List
+from concurrent.futures import ThreadPoolExecutor
 
 import typer
 from rich.console import Console
@@ -9,6 +10,8 @@ from rich.text import Text
 
 from ai_cli.core.llm import generate_response
 from ai_cli.core.prompts import explain_prompt, fix_prompt, review_prompt
+from ai_cli.core.chunking import chunk_text
+from ai_cli.core.aggregator import aggregate_responses
 
 console = Console()
 PROJECT_ROOT = Path.cwd()
@@ -17,9 +20,11 @@ SKIPPED_DIRS = {".git", ".venv", "__pycache__", "ai_cli.egg-info", "node_modules
 TEXT_SUFFIXES = {".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".txt", ".json", ".toml", ".yaml", ".yml"}
 MAX_MODEL_LINES = 200
 MAX_MODEL_CHARS = 8000
+CHUNK_SIZE = 4000
+CHUNK_OVERLAP = 400
 ModelName = Literal["phi", "gemma"]
 
-EXPLAIN_HEADINGS = ("Overview", "Key Components", "Execution Flow", "Simple Explanation")
+EXPLAIN_HEADINGS = ("Overview", "Key Components", "Execution Flow", "Simple Explanation", "Combined Summary Report")
 FIX_HEADINGS = ("Overview", "Issues", "Suggestions", "Improved Code")
 REVIEW_HEADINGS = ("Overview", "Issues", "Suggestions", "Improved Code")
 
@@ -29,7 +34,8 @@ def read_file(path: str) -> str:
     if not file_path.is_file():
         raise FileNotFoundError(path)
 
-    content = file_path.read_text(encoding="utf-8")
+    # Adding errors="replace" prevents UnicodeDecodeError on files with non-UTF-8 characters
+    content = file_path.read_text(encoding="utf-8", errors="replace")
     if not content.strip():
         raise ValueError("empty file")
 
@@ -79,32 +85,27 @@ def read_folder(path: Path) -> str | None:
     return "\n\n---\n\n".join(parts)
 
 
-def trim_code(code: str, max_chars: int = MAX_MODEL_CHARS):
-    return code[:max_chars]
+def remove_empty_and_comment_lines(content: str) -> str:
+    lines = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#") or stripped.startswith("//"):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
-def limit_model_input(
-    content: str,
-    max_lines: int = MAX_MODEL_LINES,
-    max_chars: int = MAX_MODEL_CHARS,
-) -> str:
-    lines = content.splitlines()
-    line_limited = "\n".join(lines[:max_lines])
-    limited = trim_code(line_limited, max_chars)
-
-    if limited == content:
-        return content
-
-    return f"{limited}\n\n[Input truncated to first {max_lines} lines or {max_chars} characters.]"
-
-
-def call_ai(
-    prompt: str,
+def call_ai_multi_chunk(
+    chunks: List[str],
+    prompt_fn,
     command: str,
     headings,
     model: str,
     stream: bool,
     verbose: bool,
+    task_type: str,
 ) -> str | None:
     if verbose:
         console.print(f"Model: {model}", style="dim")
@@ -113,19 +114,37 @@ def call_ai(
     if stream and verbose:
         console.print("Streaming is disabled by the current Ollama request config.", style="yellow")
 
-    with console.status("[cyan]Waiting for AI...[/cyan]", spinner="dots"):
+    responses = [None] * len(chunks)
+
+    def process_chunk(index: int, chunk: str):
+        if len(chunks) > 1:
+            chunk_context = f"This is part {index} of {len(chunks)} of a larger context. Focus only on this section.\n\n{chunk}"
+        else:
+            chunk_context = chunk
+            
+        prompt = prompt_fn(chunk_context)
         output = generate_response(prompt, model=model)
+        return index, output
 
-    if output.startswith("Error:"):
-        console.print(output, style="bold red")
-    else:
-        render_output(output, headings)
+    with console.status("[cyan]Waiting for AI processing chunks in parallel...[/cyan]", spinner="dots"):
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(process_chunk, idx, chunk) for idx, chunk in enumerate(chunks, start=1)]
+            for future in futures:
+                idx, output = future.result()
+                if output.startswith("Error:"):
+                    console.print(f"\nError processing chunk {idx}: {output}", style="bold red")
+                    responses[idx - 1] = f"Error in this part: {output}"
+                else:
+                    responses[idx - 1] = output
 
-    if output.startswith("Error:"):
+    # Check if all chunks failed
+    if all(res.startswith("Error in this part:") for res in responses):
         return None
 
-    save_last(command, output)
-    return output
+    final_output = aggregate_responses(responses, task_type=task_type)
+    render_output(final_output, headings)
+    save_last(command, final_output)
+    return final_output
 
 
 def render_output(output: str, headings) -> None:
@@ -179,9 +198,13 @@ def run_command(
     if not source:
         source = "Command produced no output."
 
-    source = limit_model_input(source)
-    prompt = fix_prompt(source) if result.returncode else explain_prompt(source)
-    return call_ai(prompt, f"run {cmd}", FIX_HEADINGS, model, stream, verbose)
+    cleaned_source = remove_empty_and_comment_lines(source)
+    chunks = chunk_text(cleaned_source, max_chars=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+    prompt_fn = fix_prompt if result.returncode else explain_prompt
+    task_type = "general" if result.returncode else "summary"
+    headings = FIX_HEADINGS if result.returncode else EXPLAIN_HEADINGS
+    
+    return call_ai_multi_chunk(chunks, prompt_fn, f"run {cmd}", headings, model, stream, verbose, task_type)
 
 
 def explain(
@@ -189,13 +212,17 @@ def explain(
     model: ModelName = typer.Option("phi", "--model", help="Ollama model to use."),
     stream: bool = typer.Option(False, "--stream/--no-stream", help="Stream output from Ollama."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show extra command details."),
+    full: bool = typer.Option(True, "--full/--no-full", help="Process every chunk one by one."),
 ) -> None:
     content = read_input(file_path)
     if content is None:
         return
 
-    content = limit_model_input(content)
-    call_ai(explain_prompt(content), f"explain {file_path}", EXPLAIN_HEADINGS, model, stream, verbose)
+    cleaned_content = remove_empty_and_comment_lines(content)
+    chunks = chunk_text(cleaned_content, max_chars=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+    selected_chunks = chunks if full else chunks[:1]
+    
+    call_ai_multi_chunk(selected_chunks, explain_prompt, f"explain {file_path}", EXPLAIN_HEADINGS, model, stream, verbose, "summary")
 
 
 def fix(
@@ -209,8 +236,10 @@ def fix(
     if content is None:
         return
 
-    content = limit_model_input(content)
-    call_ai(fix_prompt(content), "fix", FIX_HEADINGS, model, stream, verbose)
+    cleaned_content = remove_empty_and_comment_lines(content)
+    chunks = chunk_text(cleaned_content, max_chars=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+    
+    call_ai_multi_chunk(chunks, fix_prompt, "fix", FIX_HEADINGS, model, stream, verbose, "general")
 
 
 def review(
@@ -218,13 +247,17 @@ def review(
     model: ModelName = typer.Option("phi", "--model", help="Ollama model to use."),
     stream: bool = typer.Option(False, "--stream/--no-stream", help="Stream output from Ollama."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show extra command details."),
+    full: bool = typer.Option(True, "--full/--no-full", help="Process every chunk one by one."),
 ) -> None:
     content = read_input(file_path)
     if content is None:
         return
 
-    content = limit_model_input(content)
-    call_ai(review_prompt(content), f"review {file_path}", REVIEW_HEADINGS, model, stream, verbose)
+    cleaned_content = remove_empty_and_comment_lines(content)
+    chunks = chunk_text(cleaned_content, max_chars=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+    selected_chunks = chunks if full else chunks[:1]
+    
+    call_ai_multi_chunk(selected_chunks, review_prompt, f"review {file_path}", REVIEW_HEADINGS, model, stream, verbose, "general")
 
 
 def last() -> None:

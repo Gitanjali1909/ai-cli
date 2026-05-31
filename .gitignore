@@ -14,6 +14,9 @@ node_modules/
 
 # Packaging
 *.egg-info/
+dist/
+out/
+*.vsix
 
 # Generated assets
 *.mp4
